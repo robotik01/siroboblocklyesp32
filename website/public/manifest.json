@@ -1,0 +1,30 @@
+{
+  "name": "Sirobo - Belajar Coding Robot",
+  "short_name": "Sirobo",
+  "description": "Platform belajar coding robot yang menyenangkan untuk anak-anak Indonesia",
+  "start_url": "/",
+  "display": "fullscreen",
+  "orientation": "any",
+  "background_color": "#1e1b4b",
+  "theme_color": "#3b82f6",
+  "icons": [
+    {
+      "src": "/robot-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ],
+  "categories": ["education", "kids", "games"],
+  "lang": "id"
+}

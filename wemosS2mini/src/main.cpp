@@ -100,12 +100,26 @@
 #define PWM_FREQUENCY 5000
 #define PWM_RESOLUTION 8
 
-#define EEPROM_SIZE 64
+#define EEPROM_SIZE 512
 #define EEPROM_CALIBRATION_ADDR 0
+#define EEPROM_CONFIG_ADDR 10
+#define EEPROM_CONFIG_MAGIC 0xABCD
 
-// WiFi Configuration
-const char* AP_SSID = "Sirobo_Robot";
-const char* AP_PASSWORD = "sirobo123";
+// Configuration structure stored in EEPROM
+struct RobotConfig {
+  uint16_t magic;           // Magic number to check if config is valid
+  char apSSID[32];          // Access Point SSID (robot name)
+  char apPassword[32];      // Access Point password
+  char wifiSSID[32];        // Optional: connect to existing WiFi
+  char wifiPassword[32];    // Optional: WiFi password
+  bool stationMode;         // Enable station mode
+};
+
+RobotConfig config;
+
+// Default WiFi Configuration
+const char* DEFAULT_AP_SSID = "Sirobo_Robot";
+const char* DEFAULT_AP_PASSWORD = "sirobo123";
 
 // =====================================================
 // GLOBAL OBJECTS
@@ -217,6 +231,9 @@ void updateStatusDisplay();
 void loadCalibration();
 void saveCalibration();
 void autoCalibrateStraight();
+void loadConfig();
+void saveConfig();
+void sendConfig();
 
 // =====================================================
 // SETUP
@@ -389,12 +406,42 @@ void setupLEDs() {
 }
 
 void setupWiFi() {
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  // Load configuration from EEPROM
+  loadConfig();
+  
+  // If station mode enabled and valid credentials, try to connect
+  if (config.stationMode && strlen(config.wifiSSID) > 0) {
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(config.wifiSSID, config.wifiPassword);
+    
+    LOG.print("Connecting to WiFi: ");
+    LOG.println(config.wifiSSID);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      LOG.print(".");
+      attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      LOG.println();
+      LOG.print("✓ Connected to WiFi! IP: ");
+      LOG.println(WiFi.localIP());
+    } else {
+      LOG.println();
+      LOG.println("✗ Failed to connect to WiFi");
+    }
+  } else {
+    WiFi.mode(WIFI_AP);
+  }
+  
+  // Always start Access Point
+  WiFi.softAP(config.apSSID, config.apPassword);
   
   IPAddress IP = WiFi.softAPIP();
   LOG.print("✓ WiFi AP started: ");
-  LOG.println(AP_SSID);
+  LOG.println(config.apSSID);
   LOG.print("  IP Address: ");
   LOG.println(IP);
 }
@@ -584,6 +631,67 @@ void processCommand(JsonDocument& doc) {
   }
   else if (strcmp(type, "reset_yaw") == 0) {
     yawOffset = yaw;
+  }
+  else if (strcmp(type, "config") == 0) {
+    // Update robot configuration
+    const char* robotName = doc["robotName"];
+    const char* apPassword = doc["apPassword"];
+    const char* wifiSSID = doc["wifiSSID"];
+    const char* wifiPassword = doc["wifiPassword"];
+    
+    if (robotName && strlen(robotName) > 0) {
+      strncpy(config.apSSID, robotName, 31);
+      config.apSSID[31] = '\0';
+    }
+    if (apPassword && strlen(apPassword) >= 8) {
+      strncpy(config.apPassword, apPassword, 31);
+      config.apPassword[31] = '\0';
+    }
+    if (wifiSSID) {
+      strncpy(config.wifiSSID, wifiSSID, 31);
+      config.wifiSSID[31] = '\0';
+      config.stationMode = strlen(wifiSSID) > 0;
+    }
+    if (wifiPassword) {
+      strncpy(config.wifiPassword, wifiPassword, 31);
+      config.wifiPassword[31] = '\0';
+    }
+    
+    saveConfig();
+    
+    // Send confirmation
+    JsonDocument response;
+    response["type"] = "config_saved";
+    response["success"] = true;
+    String output;
+    serializeJson(response, output);
+    ws.textAll(output);
+    
+    // Restart after 2 seconds
+    delay(2000);
+    ESP.restart();
+  }
+  else if (strcmp(type, "get_config") == 0) {
+    sendConfig();
+  }
+  else if (strcmp(type, "scan_wifi") == 0) {
+    // Scan for WiFi networks
+    int n = WiFi.scanNetworks();
+    JsonDocument response;
+    response["type"] = "wifi_scan";
+    JsonArray networks = response["networks"].to<JsonArray>();
+    
+    for (int i = 0; i < n && i < 10; i++) {
+      JsonObject net = networks.add<JsonObject>();
+      net["ssid"] = WiFi.SSID(i);
+      net["rssi"] = WiFi.RSSI(i);
+      net["secured"] = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+    }
+    
+    String output;
+    serializeJson(response, output);
+    ws.textAll(output);
+    WiFi.scanDelete();
   }
 }
 
@@ -1142,5 +1250,55 @@ void sendSensorData() {
   String output;
   serializeJson(doc, output);
   
+  ws.textAll(output);
+}
+
+// =====================================================
+// CONFIGURATION MANAGEMENT
+// =====================================================
+
+void loadConfig() {
+  EEPROM.get(EEPROM_CONFIG_ADDR, config);
+  
+  // Check if config is valid (magic number)
+  if (config.magic != EEPROM_CONFIG_MAGIC) {
+    // Initialize with defaults
+    LOG.println("No valid config found, using defaults");
+    config.magic = EEPROM_CONFIG_MAGIC;
+    strncpy(config.apSSID, DEFAULT_AP_SSID, 31);
+    strncpy(config.apPassword, DEFAULT_AP_PASSWORD, 31);
+    config.wifiSSID[0] = '\0';
+    config.wifiPassword[0] = '\0';
+    config.stationMode = false;
+    saveConfig();
+  }
+  
+  LOG.printf("✓ Config loaded: AP=%s\n", config.apSSID);
+}
+
+void saveConfig() {
+  config.magic = EEPROM_CONFIG_MAGIC;
+  EEPROM.put(EEPROM_CONFIG_ADDR, config);
+  EEPROM.commit();
+  
+  LOG.println("✓ Config saved to EEPROM");
+}
+
+void sendConfig() {
+  JsonDocument doc;
+  doc["type"] = "config";
+  doc["robotName"] = config.apSSID;
+  doc["apPassword"] = "********"; // Don't send actual password
+  doc["wifiSSID"] = config.wifiSSID;
+  doc["stationMode"] = config.stationMode;
+  
+  // Add IP addresses
+  doc["apIP"] = WiFi.softAPIP().toString();
+  if (WiFi.status() == WL_CONNECTED) {
+    doc["stationIP"] = WiFi.localIP().toString();
+  }
+  
+  String output;
+  serializeJson(doc, output);
   ws.textAll(output);
 }

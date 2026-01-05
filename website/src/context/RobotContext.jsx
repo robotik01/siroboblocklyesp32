@@ -22,6 +22,13 @@ export function RobotProvider({ children }) {
     buttons: [false, false, false, false],
     motorCalibration: { left: 0, right: 0 }
   })
+  const [robotConfig, setRobotConfig] = useState({
+    robotName: 'Sirobo_Robot',
+    apIP: '192.168.4.1',
+    stationIP: null,
+    stationMode: false
+  })
+  const [availableNetworks, setAvailableNetworks] = useState([])
   const [isLiveMode, setIsLiveMode] = useState(true)
   const wsRef = useRef(null)
   const reconnectTimeoutRef = useRef(null)
@@ -41,7 +48,24 @@ export function RobotProvider({ children }) {
       wsRef.current.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data)
-          setRobotData(prev => ({ ...prev, ...data }))
+          
+          // Handle different message types
+          if (data.type === 'config') {
+            setRobotConfig(prev => ({
+              ...prev,
+              robotName: data.robotName || prev.robotName,
+              apIP: data.apIP || prev.apIP,
+              stationIP: data.stationIP || null,
+              stationMode: data.stationMode || false
+            }))
+          } else if (data.type === 'wifi_scan') {
+            setAvailableNetworks(data.networks || [])
+          } else if (data.type === 'config_saved') {
+            console.log('Config saved successfully')
+          } else {
+            // Regular sensor data
+            setRobotData(prev => ({ ...prev, ...data }))
+          }
         } catch (e) {
           console.error('Failed to parse robot data:', e)
         }
@@ -167,6 +191,8 @@ export function RobotProvider({ children }) {
     robotIP,
     updateRobotIP,
     robotData,
+    robotConfig,
+    availableNetworks,
     isLiveMode,
     setIsLiveMode,
     connectWebSocket,
