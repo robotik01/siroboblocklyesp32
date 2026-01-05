@@ -1,7 +1,7 @@
 import React from 'react'
 import { useNavigate } from 'react-router-dom'
 import { motion } from 'framer-motion'
-import { Gamepad2, Wrench, Code, GraduationCap, Wifi, WifiOff, Settings } from 'lucide-react'
+import { Gamepad2, Wrench, Code, GraduationCap, Wifi, WifiOff } from 'lucide-react'
 import { useRobot } from '../context/RobotContext'
 import RobotMascot from '../components/RobotMascot'
 import ConnectionModal from '../components/ConnectionModal'
@@ -97,16 +97,8 @@ function Home() {
           >
             {connected ? <Wifi size={20} /> : <WifiOff size={20} />}
             <span className="text-sm font-semibold">
-              {connected ? 'Terhubung' : 'Tidak Terhubung'}
+              {connected ? 'Robot Terhubung' : 'Robot Tidak Terhubung'}
             </span>
-          </motion.button>
-
-          <motion.button
-            className="p-2 rounded-full glass text-white/70 hover:text-white"
-            whileHover={{ scale: 1.1, rotate: 90 }}
-            whileTap={{ scale: 0.9 }}
-          >
-            <Settings size={24} />
           </motion.button>
         </div>
       </motion.header>

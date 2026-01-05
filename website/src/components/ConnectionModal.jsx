@@ -220,7 +220,7 @@ function ConnectionModal({ onClose }) {
                 <div className="flex items-center gap-3">
                   <div className={`w-4 h-4 rounded-full ${isConnected ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`} />
                   <span className={`font-semibold ${isConnected ? 'text-green-400' : 'text-red-400'}`}>
-                    {isConnected ? 'Terhubung' : 'Tidak Terhubung'}
+                    {isConnected ? 'Robot Terhubung' : 'Robot Tidak Terhubung'}
                   </span>
                 </div>
                 {isConnected && (

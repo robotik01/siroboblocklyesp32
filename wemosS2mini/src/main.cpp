@@ -24,6 +24,11 @@
  * - WiFi Access Point Mode
  * - WebSocket for real-time control
  * - HTTP Server for code upload
+ * - OTA Update support
+ * 
+ * Firmware Mode:
+ * - LIVE: Real-time control via WebSocket (default)
+ * - OFFLINE: Runs compiled code autonomously
  */
 
 #include <Arduino.h>
@@ -38,6 +43,7 @@
 #include <Adafruit_Sensor.h>
 #include <FastLED.h>
 #include <EEPROM.h>
+#include <Update.h>
 
 // Use Serial1 for logging (hardware UART)
 #define LOG Serial1
@@ -105,6 +111,11 @@
 #define EEPROM_CONFIG_ADDR 10
 #define EEPROM_CONFIG_MAGIC 0xABCD
 
+// Firmware version
+#define FIRMWARE_VERSION "1.0.0"
+#define FIRMWARE_MODE_LIVE 0
+#define FIRMWARE_MODE_OFFLINE 1
+
 // Configuration structure stored in EEPROM
 struct RobotConfig {
   uint16_t magic;           // Magic number to check if config is valid
@@ -113,13 +124,23 @@ struct RobotConfig {
   char wifiSSID[32];        // Optional: connect to existing WiFi
   char wifiPassword[32];    // Optional: WiFi password
   bool stationMode;         // Enable station mode
+  uint8_t firmwareMode;     // 0 = LIVE, 1 = OFFLINE
 };
 
 RobotConfig config;
 
-// Default WiFi Configuration
-const char* DEFAULT_AP_SSID = "Sirobo_Robot";
-const char* DEFAULT_AP_PASSWORD = "sirobo123";
+// Default WiFi Configuration - Random SSID format: siroboXXXXX
+const char* DEFAULT_AP_PASSWORD = "siroboayo";
+
+// Generate random SSID like siroboAB123
+String generateRandomSSID() {
+  String ssid = "sirobo";
+  const char chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  for (int i = 0; i < 5; i++) {
+    ssid += chars[random(0, strlen(chars))];
+  }
+  return ssid;
+}
 
 // =====================================================
 // GLOBAL OBJECTS
@@ -176,6 +197,11 @@ unsigned long lastSensorRead = 0;
 unsigned long lastWebSocketUpdate = 0;
 bool clientConnected = false;
 
+// OTA Update state
+bool otaInProgress = false;
+size_t otaContentLength = 0;
+size_t otaReceived = 0;
+
 // =====================================================
 // FUNCTION PROTOTYPES
 // =====================================================
@@ -189,6 +215,7 @@ void setupLEDs();
 void setupWiFi();
 void setupWebServer();
 void setupWebSocket();
+void setupOTA();
 
 void readSensors();
 void updateIMU();
@@ -248,7 +275,10 @@ void setup() {
   LOG.println("╚════██║██║██╔══██╗██║   ██║██╔══██╗██║   ██║");
   LOG.println("███████║██║██║  ██║╚██████╔╝██████╔╝╚██████╔╝");
   LOG.println("╚══════╝╚═╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝  ╚═════╝ ");
-  LOG.println("\nSirobo Robot - Initializing...\n");
+  LOG.printf("\nSirobo Robot v%s - Initializing...\n\n", FIRMWARE_VERSION);
+  
+  // Initialize random seed for SSID generation
+  randomSeed(analogRead(0) + millis());
   
   EEPROM.begin(EEPROM_SIZE);
   
@@ -267,10 +297,12 @@ void setup() {
   setupWiFi();
   setupWebSocket();
   setupWebServer();
+  setupOTA();
   
   showWelcomeScreen();
   
   LOG.println("✓ Sirobo ready!");
+  LOG.printf("  Mode: %s\n", config.firmwareMode == FIRMWARE_MODE_LIVE ? "LIVE" : "OFFLINE");
 }
 
 // =====================================================
@@ -489,6 +521,20 @@ void setupWebServer() {
       "</body></html>");
   });
   
+  // Ping endpoint for robot discovery
+  server.on("/ping", HTTP_GET, [](AsyncWebServerRequest *request) {
+    JsonDocument doc;
+    doc["device"] = "sirobo";
+    doc["name"] = config.apSSID;
+    doc["version"] = FIRMWARE_VERSION;
+    doc["mode"] = config.firmwareMode == FIRMWARE_MODE_LIVE ? "live" : "offline";
+    doc["ip"] = WiFi.softAPIP().toString();
+    
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+  
   // Status endpoint
   server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
     JsonDocument doc;
@@ -515,6 +561,142 @@ void setupWebServer() {
   
   server.begin();
   LOG.println("✓ Web server started");
+}
+
+// =====================================================
+// OTA UPDATE SETUP
+// =====================================================
+
+void setupOTA() {
+  // OTA Update endpoint
+  server.on("/update", HTTP_POST, 
+    // Response handler
+    [](AsyncWebServerRequest *request) {
+      bool success = !Update.hasError();
+      AsyncWebServerResponse *response = request->beginResponse(
+        success ? 200 : 500, 
+        "application/json", 
+        success ? "{\"success\":true,\"message\":\"Update successful, rebooting...\"}" 
+                : "{\"success\":false,\"message\":\"Update failed\"}"
+      );
+      response->addHeader("Connection", "close");
+      request->send(response);
+      
+      if (success) {
+        LOG.println("✓ OTA Update successful, rebooting...");
+        delay(500);
+        ESP.restart();
+      }
+    },
+    // Upload handler
+    [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+      if (!index) {
+        LOG.printf("OTA Update starting: %s\n", filename.c_str());
+        otaInProgress = true;
+        otaReceived = 0;
+        
+        // Get content length from header
+        if (request->hasHeader("Content-Length")) {
+          otaContentLength = request->getHeader("Content-Length")->value().toInt();
+        }
+        
+        // Stop motors and show update screen
+        robotStop();
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setCursor(10, 20);
+        display.println("OTA UPDATE");
+        display.setCursor(10, 35);
+        display.println("Please wait...");
+        display.display();
+        
+        setAllLEDs(255, 165, 0); // Orange
+        
+        if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+          LOG.printf("Update.begin failed: %s\n", Update.errorString());
+          Update.printError(LOG);
+        }
+      }
+      
+      if (len) {
+        otaReceived += len;
+        if (Update.write(data, len) != len) {
+          LOG.printf("Update.write failed: %s\n", Update.errorString());
+          Update.printError(LOG);
+        }
+        
+        // Update progress display
+        if (otaContentLength > 0) {
+          int progress = (otaReceived * 100) / otaContentLength;
+          display.fillRect(10, 50, 108, 10, SSD1306_BLACK);
+          display.drawRect(10, 50, 108, 10, SSD1306_WHITE);
+          display.fillRect(12, 52, progress, 6, SSD1306_WHITE);
+          display.display();
+        }
+      }
+      
+      if (final) {
+        if (Update.end(true)) {
+          LOG.printf("OTA Update complete: %u bytes\n", otaReceived);
+          setAllLEDs(0, 255, 0); // Green
+          display.clearDisplay();
+          display.setCursor(10, 30);
+          display.println("UPDATE COMPLETE!");
+          display.display();
+        } else {
+          LOG.printf("Update.end failed: %s\n", Update.errorString());
+          Update.printError(LOG);
+          setAllLEDs(255, 0, 0); // Red
+        }
+        otaInProgress = false;
+      }
+    }
+  );
+  
+  // Switch firmware mode endpoint
+  server.on("/mode", HTTP_POST, [](AsyncWebServerRequest *request) {
+    if (request->hasParam("mode", true)) {
+      String mode = request->getParam("mode", true)->value();
+      if (mode == "live") {
+        config.firmwareMode = FIRMWARE_MODE_LIVE;
+      } else if (mode == "offline") {
+        config.firmwareMode = FIRMWARE_MODE_OFFLINE;
+      }
+      saveConfig();
+      
+      JsonDocument doc;
+      doc["success"] = true;
+      doc["mode"] = config.firmwareMode == FIRMWARE_MODE_LIVE ? "live" : "offline";
+      doc["message"] = "Mode changed, rebooting...";
+      
+      String response;
+      serializeJson(doc, response);
+      request->send(200, "application/json", response);
+      
+      delay(500);
+      ESP.restart();
+    } else {
+      request->send(400, "application/json", "{\"error\":\"Missing mode parameter\"}");
+    }
+  });
+  
+  // Get firmware info
+  server.on("/info", HTTP_GET, [](AsyncWebServerRequest *request) {
+    JsonDocument doc;
+    doc["device"] = "sirobo";
+    doc["name"] = config.apSSID;
+    doc["version"] = FIRMWARE_VERSION;
+    doc["mode"] = config.firmwareMode == FIRMWARE_MODE_LIVE ? "live" : "offline";
+    doc["heap"] = ESP.getFreeHeap();
+    doc["uptime"] = millis();
+    doc["chip"] = ESP.getChipModel();
+    
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+  
+  LOG.println("✓ OTA Update configured");
 }
 
 // =====================================================
@@ -692,6 +874,55 @@ void processCommand(JsonDocument& doc) {
     serializeJson(response, output);
     ws.textAll(output);
     WiFi.scanDelete();
+  }
+  else if (strcmp(type, "set_mode") == 0) {
+    // Set firmware mode (live/offline)
+    const char* mode = doc["mode"];
+    if (mode) {
+      if (strcmp(mode, "live") == 0) {
+        config.firmwareMode = FIRMWARE_MODE_LIVE;
+      } else if (strcmp(mode, "offline") == 0) {
+        config.firmwareMode = FIRMWARE_MODE_OFFLINE;
+      }
+      saveConfig();
+      
+      JsonDocument response;
+      response["type"] = "mode_changed";
+      response["mode"] = config.firmwareMode == FIRMWARE_MODE_LIVE ? "live" : "offline";
+      response["reboot"] = true;
+      String output;
+      serializeJson(response, output);
+      ws.textAll(output);
+      
+      delay(500);
+      ESP.restart();
+    }
+  }
+  else if (strcmp(type, "get_info") == 0) {
+    // Get robot info
+    JsonDocument response;
+    response["type"] = "info";
+    response["name"] = config.apSSID;
+    response["version"] = FIRMWARE_VERSION;
+    response["mode"] = config.firmwareMode == FIRMWARE_MODE_LIVE ? "live" : "offline";
+    response["heap"] = ESP.getFreeHeap();
+    response["uptime"] = millis();
+    
+    String output;
+    serializeJson(response, output);
+    ws.textAll(output);
+  }
+  else if (strcmp(type, "ping") == 0) {
+    // Respond to ping
+    JsonDocument response;
+    response["type"] = "pong";
+    response["device"] = "sirobo";
+    response["name"] = config.apSSID;
+    response["version"] = FIRMWARE_VERSION;
+    
+    String output;
+    serializeJson(response, output);
+    ws.textAll(output);
   }
 }
 
@@ -1263,17 +1494,20 @@ void loadConfig() {
   // Check if config is valid (magic number)
   if (config.magic != EEPROM_CONFIG_MAGIC) {
     // Initialize with defaults
-    LOG.println("No valid config found, using defaults");
+    LOG.println("No valid config found, generating new SSID");
     config.magic = EEPROM_CONFIG_MAGIC;
-    strncpy(config.apSSID, DEFAULT_AP_SSID, 31);
+    String randomSSID = generateRandomSSID();
+    strncpy(config.apSSID, randomSSID.c_str(), 31);
     strncpy(config.apPassword, DEFAULT_AP_PASSWORD, 31);
     config.wifiSSID[0] = '\0';
     config.wifiPassword[0] = '\0';
     config.stationMode = false;
+    config.firmwareMode = FIRMWARE_MODE_LIVE; // Default to live mode
     saveConfig();
   }
   
-  LOG.printf("✓ Config loaded: AP=%s\n", config.apSSID);
+  LOG.printf("✓ Config loaded: AP=%s, Mode=%s\n", config.apSSID, 
+             config.firmwareMode == FIRMWARE_MODE_LIVE ? "LIVE" : "OFFLINE");
 }
 
 void saveConfig() {
@@ -1291,6 +1525,8 @@ void sendConfig() {
   doc["apPassword"] = "********"; // Don't send actual password
   doc["wifiSSID"] = config.wifiSSID;
   doc["stationMode"] = config.stationMode;
+  doc["firmwareMode"] = config.firmwareMode == FIRMWARE_MODE_LIVE ? "live" : "offline";
+  doc["version"] = FIRMWARE_VERSION;
   
   // Add IP addresses
   doc["apIP"] = WiFi.softAPIP().toString();

@@ -2,6 +2,9 @@ import React, { createContext, useContext, useState, useCallback, useEffect, use
 
 const RobotContext = createContext()
 
+// API Server for compilation
+const API_SERVER = 'https://involuntary-cryptonymous-delaine.ngrok-free.dev'
+
 export function useRobot() {
   return useContext(RobotContext)
 }
@@ -26,12 +29,61 @@ export function RobotProvider({ children }) {
     robotName: 'Sirobo_Robot',
     apIP: '192.168.4.1',
     stationIP: null,
-    stationMode: false
+    stationMode: false,
+    firmwareMode: 'live' // 'live' or 'offline'
   })
   const [availableNetworks, setAvailableNetworks] = useState([])
+  const [nearbyRobots, setNearbyRobots] = useState([])
   const [isLiveMode, setIsLiveMode] = useState(true)
+  const [isScanning, setIsScanning] = useState(false)
+  const [compileStatus, setCompileStatus] = useState({ status: 'idle', message: '' })
   const wsRef = useRef(null)
   const reconnectTimeoutRef = useRef(null)
+
+  // Check if running in Android WebView
+  const isAndroidApp = useCallback(() => {
+    return typeof window !== 'undefined' && window.Android && window.Android.isAndroidApp && window.Android.isAndroidApp()
+  }, [])
+
+  // Scan for nearby robots (uses Android native WiFi scan)
+  const scanForRobots = useCallback(async () => {
+    setIsScanning(true)
+    try {
+      if (isAndroidApp() && window.Android.scanForRobots) {
+        const result = window.Android.scanForRobots()
+        const robots = JSON.parse(result)
+        setNearbyRobots(robots)
+        return robots
+      } else {
+        // Fallback: try common IPs
+        const commonIPs = ['192.168.4.1', '192.168.1.1', '192.168.0.1']
+        const foundRobots = []
+        
+        for (const ip of commonIPs) {
+          try {
+            const response = await fetch(`http://${ip}/ping`, { 
+              method: 'GET',
+              timeout: 2000 
+            })
+            if (response.ok) {
+              const data = await response.json()
+              foundRobots.push({ ssid: data.robotName || 'Sirobo', ip, signal: -50 })
+            }
+          } catch (e) {
+            // IP not responding
+          }
+        }
+        
+        setNearbyRobots(foundRobots)
+        return foundRobots
+      }
+    } catch (error) {
+      console.error('Error scanning for robots:', error)
+      return []
+    } finally {
+      setIsScanning(false)
+    }
+  }, [isAndroidApp])
 
   // WebSocket connection
   const connectWebSocket = useCallback(() => {
@@ -174,6 +226,78 @@ export function RobotProvider({ children }) {
     }
   }, [robotIP])
 
+  // Compile code using API server
+  const compileCode = useCallback(async (code) => {
+    setCompileStatus({ status: 'compiling', message: 'Mengkompilasi program...' })
+    try {
+      const response = await fetch(`${API_SERVER}/compile`, {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'ngrok-skip-browser-warning': 'true'
+        },
+        body: JSON.stringify({ code, board: 'lolin_s2_mini' })
+      })
+      
+      if (!response.ok) {
+        const error = await response.json()
+        setCompileStatus({ status: 'error', message: error.message || 'Kompilasi gagal' })
+        return null
+      }
+      
+      const result = await response.json()
+      setCompileStatus({ status: 'success', message: 'Kompilasi berhasil!' })
+      return result
+    } catch (error) {
+      console.error('Compile failed:', error)
+      setCompileStatus({ status: 'error', message: 'Server tidak tersedia' })
+      return null
+    }
+  }, [])
+
+  // Upload firmware via OTA
+  const uploadFirmwareOTA = useCallback(async (firmwareData) => {
+    setCompileStatus({ status: 'uploading', message: 'Mengupload firmware via OTA...' })
+    try {
+      const response = await fetch(`http://${robotIP}/update`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: firmwareData
+      })
+      
+      if (response.ok) {
+        setCompileStatus({ status: 'success', message: 'Firmware berhasil diupload!' })
+        return true
+      } else {
+        setCompileStatus({ status: 'error', message: 'Upload firmware gagal' })
+        return false
+      }
+    } catch (error) {
+      console.error('OTA upload failed:', error)
+      setCompileStatus({ status: 'error', message: 'Upload OTA gagal' })
+      return false
+    }
+  }, [robotIP])
+
+  // Switch firmware mode (live/offline)
+  const switchFirmwareMode = useCallback(async (mode) => {
+    if (mode === 'live' && robotConfig.firmwareMode !== 'live') {
+      // Need to upload live firmware first
+      setCompileStatus({ status: 'switching', message: 'Mengupload firmware live programming...' })
+      const response = await fetch(`${API_SERVER}/firmware/live`, {
+        headers: { 'ngrok-skip-browser-warning': 'true' }
+      })
+      
+      if (response.ok) {
+        const firmware = await response.arrayBuffer()
+        await uploadFirmwareOTA(firmware)
+      }
+    }
+    
+    setRobotConfig(prev => ({ ...prev, firmwareMode: mode }))
+    setIsLiveMode(mode === 'live')
+  }, [robotConfig.firmwareMode, uploadFirmwareOTA])
+
   // Save robot IP
   const updateRobotIP = useCallback((ip) => {
     setRobotIP(ip)
@@ -193,7 +317,11 @@ export function RobotProvider({ children }) {
     robotData,
     robotConfig,
     availableNetworks,
+    nearbyRobots,
     isLiveMode,
+    isScanning,
+    compileStatus,
+    isAndroidApp,
     setIsLiveMode,
     connectWebSocket,
     disconnect,
@@ -210,7 +338,11 @@ export function RobotProvider({ children }) {
     runLineFollower,
     turnToAngle,
     executeCode,
-    uploadCode
+    uploadCode,
+    scanForRobots,
+    compileCode,
+    uploadFirmwareOTA,
+    switchFirmwareMode
   }
 
   return (
